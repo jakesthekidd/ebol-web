@@ -1,0 +1,36 @@
+@import "primeicons/primeicons.css";
+@import "leaflet/dist/leaflet.css";
+
+/* Global resets */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--p-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif);
+  font-size: 14px;
+  color: var(--p-text-color, #1e293b);
+  background: var(--p-surface-ground, #f8fafc);
+}
+
+/* Anchor reset */
+a {
+  color: inherit;
+}
+
+/* PrimeNG table tweaks */
+.p-datatable .p-datatable-thead > tr > th {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+
+/* Utility spacing */
+.mb-3 { margin-bottom: 0.75rem !important; }
+.mb-4 { margin-bottom: 1rem !important; }
+.w-full { width: 100% !important; }
