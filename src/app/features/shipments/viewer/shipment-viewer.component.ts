@@ -15,11 +15,22 @@ import { supabase } from '../../../lib/supabase/client';
 interface AnnotationItem {
   id: string;
   bolId: string;
-  type: 'signature' | 'highlight' | 'redact';
+  type: 'signature' | 'highlight' | 'redact' | 'form_field' | 'date_stamp';
   x: number; y: number; width: number; height: number;
-  imageUrl?: string;
+  pageNumber?: number;        // for filtering by current page
+  // ── Signature variants ──
+  imageUrl?: string;          // raster PNG (legacy / desktop-placed)
+  strokeData?: number[][][];  // drawn vector strokes [[{x,y},...],...] flattened to [[ [x,y], ...], ...]
+  rawStrokes?: { x: number; y: number }[][]; // shape from mobile JSON
+  typedValue?: string;        // typed name OR typed freeform value
+  signatureKind?: 'drawn' | 'typed' | 'image';
   signerName?: string;
   signerType?: 'driver' | 'consignee';
+  signerRole?: 'driver' | 'consignee';
+  // ── Form field / date stamp variants ──
+  fieldLabel?: string;
+  fieldValue?: string;
+  rotation?: number;
 }
 
 @Component({
@@ -87,9 +98,18 @@ interface AnnotationItem {
     /* PDF iframe */
     .pdf-frame {
       flex: 1; min-height: 0; position: relative;
+      overflow: auto;        /* scrolls iframe + annotation layer together */
+      background: #0a1520;
     }
-    .pdf-frame iframe {
+    .pdf-stack {
+      position: relative; width: 100%;
+      /* aspect-ratio is set inline as 8.5 / (11 * pageCount) so the stack is
+         tall enough to hold every page at #zoom=page-width */
+    }
+    .pdf-stack iframe {
+      position: absolute; inset: 0;
       width: 100%; height: 100%; border: none; display: block;
+      pointer-events: none;  /* let scroll wheel pass through to .pdf-frame */
     }
     .pdf-no-doc {
       position: absolute; inset: 0;
@@ -430,8 +450,23 @@ interface AnnotationItem {
       border-radius: 4px; padding: 3px 5px; box-shadow: 0 2px 8px rgba(0,0,0,0.18);
     }
     .ann-sig-img { max-width: 100%; max-height: 80%; object-fit: contain; }
+    .ann-item.ann-sig-bare { background: transparent; border: none; padding: 0; box-shadow: none; }
+    .ann-sig-svg { width: 100%; height: 100%; display: block; }
+    .ann-sig-typed {
+      width: 100%; height: 100%; font-family: 'Brush Script MT', cursive;
+      font-size: clamp(14px,90%,42px); color: #1e293b;
+      display: flex; align-items: center; justify-content: center;
+      white-space: nowrap; overflow: hidden; line-height: 1;
+    }
     .ann-sig-name { font-size: 9px; font-weight: 700; color: #4338ca; white-space: nowrap; margin-top: 1px; }
-    .ann-sig-role { font-size: 8px; color: #6366f1; text-transform: uppercase; letter-spacing: 0.04em; }
+    .ann-item.ann-form-field {
+      display: flex; flex-direction: column; justify-content: center;
+      background: rgba(239,246,255,0.92); border: 1.5px solid #3b82f6;
+      border-radius: 4px; padding: 2px 6px; overflow: hidden;
+    }
+    .ann-ff-label { font-size: 8px; font-weight: 700; color: #1e40af; text-transform: uppercase; white-space: nowrap; line-height: 1; }
+    .ann-ff-value { font-size: clamp(10px,60%,22px); font-weight: 700; color: #0f172a; white-space: nowrap; line-height: 1.1; margin-top: 1px; }
+    .ann-ds-value { font-size: clamp(10px,60%,18px); font-weight: 600; color: #0f172a; white-space: nowrap; padding: 0 4px; }
 
     .ann-delete-btn {
       position: absolute; top: -8px; right: -8px;
@@ -451,6 +486,11 @@ interface AnnotationItem {
     }
 
     /* ── Compact sig status in right panel ── */
+    .sig-stop-group { display: flex; flex-direction: column; gap: 0.25rem; }
+    .sig-stop-group + .sig-stop-group { margin-top: 0.625rem; }
+    .sig-stop-header { display: flex; align-items: center; gap: 0.375rem; padding-bottom: 0.25rem; margin-bottom: 0.125rem; border-bottom: 1px solid #f1f5f9; }
+    .sig-stop-num { font-size: 10px; font-weight: 700; color: #3b82f6; text-transform: uppercase; letter-spacing: 0.05em; }
+    .sig-stop-name-label { font-size: 10px; color: #94a3b8; }
     .sig-status-list { display: flex; flex-direction: column; gap: 0.375rem; }
     .sig-status-row-item {
       display: flex; align-items: center; gap: 0.625rem;
@@ -640,40 +680,58 @@ interface AnnotationItem {
 
           <div class="pdf-frame">
             @if (safeUrl()) {
-              <iframe [src]="safeUrl()!" title="BOL Document"></iframe>
-            } @else {
-              <div class="pdf-no-doc">
-                <i class="pi pi-file-pdf"></i>
-                <p>No document attached</p>
-              </div>
-            }
-
-            <!-- Annotation overlay -->
-            <div
-              class="annotation-layer"
-              [class.tool-active]="activeTool() !== 'none'"
-              [class.tool-highlight]="activeTool() === 'highlight'"
-              [class.tool-redact]="activeTool() === 'redact'"
-              [class.tool-placing]="activeTool() === 'signature' && sigToPlace()"
-              (mousedown)="onAnnMouseDown($event)"
-              (mousemove)="onAnnMouseMove($event)"
-              (mouseup)="onAnnMouseUp($event)"
-              (mouseleave)="onAnnMouseLeave()"
-            >
+              <!--
+                Scroll wrapper: iframe + annotation layer share the same scroll
+                container so overlays move with the PDF.  The stack height
+                accommodates all pages — width × (11/8.5) × pageCount, matching
+                Chrome's #zoom=page-width rendering.
+              -->
+              <div class="pdf-stack" [style.aspect-ratio]="'8.5 / ' + (11 * pageCount())">
+                <iframe [src]="safeUrl()!" title="BOL Document"></iframe>
+                <div
+                  class="annotation-layer"
+                  [class.tool-active]="activeTool() !== 'none'"
+                  [class.tool-highlight]="activeTool() === 'highlight'"
+                  [class.tool-redact]="activeTool() === 'redact'"
+                  [class.tool-placing]="activeTool() === 'signature' && sigToPlace()"
+                  (mousedown)="onAnnMouseDown($event)"
+                  (mousemove)="onAnnMouseMove($event)"
+                  (mouseup)="onAnnMouseUp($event)"
+                  (mouseleave)="onAnnMouseLeave()"
+                >
               @for (ann of annotationsForBol(); track ann.id) {
                 <div
                   class="ann-item"
                   [class.ann-highlight]="ann.type === 'highlight'"
                   [class.ann-redact]="ann.type === 'redact'"
-                  [class.ann-sig-item]="ann.type === 'signature'"
+                  [class.ann-sig-item]="ann.type === 'signature' && ann.signatureKind === 'image'"
+                  [class.ann-sig-bare]="ann.type === 'signature' && ann.signatureKind !== 'image'"
+                  [class.ann-form-field]="ann.type === 'form_field' || ann.type === 'date_stamp'"
                   [style.left.%]="ann.x"
-                  [style.top.%]="ann.y"
+                  [style.top.%]="(((ann.pageNumber ?? 1) - 1) * 100 + ann.y) / pageCount()"
                   [style.width.%]="ann.width"
-                  [style.height.%]="ann.height"
+                  [style.height.%]="ann.height / pageCount()"
+                  [style.transform]="ann.rotation ? 'rotate(' + ann.rotation + 'rad)' : null"
                 >
                   @if (ann.type === 'signature') {
-                    <img class="ann-sig-img" [src]="ann.imageUrl" />
-                    <div class="ann-sig-name">{{ ann.signerName }}</div>
+                    @if (ann.signatureKind === 'drawn' && ann.rawStrokes) {
+                      <svg class="ann-sig-svg" [attr.viewBox]="strokesToSvgPath(ann.rawStrokes).viewBox" preserveAspectRatio="xMidYMid meet">
+                        <path [attr.d]="strokesToSvgPath(ann.rawStrokes).d" fill="none" stroke="#0f172a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"></path>
+                      </svg>
+                    } @else if (ann.signatureKind === 'typed' && ann.typedValue) {
+                      <svg class="ann-sig-svg" preserveAspectRatio="xMidYMid meet" [attr.viewBox]="'0 0 ' + (ann.typedValue.length * 26) + ' 60'">
+                        <text x="50%" y="46" text-anchor="middle" font-family="Brush Script MT, Lucida Handwriting, cursive" font-size="52" fill="#1e293b">{{ ann.typedValue }}</text>
+                      </svg>
+                    } @else if (ann.imageUrl) {
+                      <img class="ann-sig-img" [src]="ann.imageUrl" />
+                    }
+                  } @else if (ann.type === 'form_field') {
+                    @if (ann.fieldLabel) {
+                      <div class="ann-ff-label">{{ ann.fieldLabel }}</div>
+                    }
+                    <div class="ann-ff-value">{{ ann.fieldValue }}</div>
+                  } @else if (ann.type === 'date_stamp') {
+                    <div class="ann-ds-value">{{ ann.fieldValue }}</div>
                   }
                   <button type="button" class="ann-delete-btn" (click)="removeAnnotation(ann.id); $event.stopPropagation()">
                     <i class="pi pi-times"></i>
@@ -698,7 +756,14 @@ interface AnnotationItem {
                   <i class="pi pi-map-marker"></i> Click to place signature
                 </div>
               }
-            </div>
+                </div>
+              </div>
+            } @else {
+              <div class="pdf-no-doc">
+                <i class="pi pi-file-pdf"></i>
+                <p>No document attached</p>
+              </div>
+            }
           </div>
         </div>
 
@@ -846,33 +911,45 @@ interface AnnotationItem {
                 </div>
               </div>
 
-              <!-- Signatures (status-only) -->
+              <!-- Signatures (by stop) -->
               <div class="section">
                 <div class="section-title">Signatures</div>
-                <div class="sig-status-list">
-                  @for (role of [{ key: 'driver', label: 'Driver', icon: 'pi-user' }, { key: 'consignee', label: 'Consignee', icon: 'pi-building' }]; track role.key) {
-                    <div class="sig-status-row-item">
-                      <i class="pi {{ role.icon }} sig-status-row-icon"></i>
-                      <span class="sig-status-role">{{ role.label }}</span>
-                      @if (getSignature(bol, role.key === 'driver' ? 'driver' : 'consignee'); as sig) {
-                        <span class="sig-status-name">{{ sig.signer_name }}</span>
-                        <span class="sig-status-date">{{ formatDate(sig.signed_at) }}</span>
-                        <span class="sig-status-pill signed" style="margin-left:auto;">
-                          <span class="sig-dot signed"></span>Signed
-                        </span>
-                      } @else if (isSignedByStatus(bol, role.key === 'driver' ? 'driver' : 'consignee')) {
-                        <span class="sig-status-name">{{ role.key === 'driver' ? (bol.driver_email ?? 'Driver') : 'Consignee' }}</span>
-                        <span class="sig-status-pill signed" style="margin-left:auto;">
-                          <span class="sig-dot signed"></span>Signed
-                        </span>
-                      } @else {
-                        <span class="sig-status-pill pending" style="margin-left:auto;">
-                          <span class="sig-dot pending"></span>Pending
-                        </span>
+                @for (b of bols(); track b.id) {
+                  <div class="sig-stop-group">
+                    @if (bols().length > 1) {
+                      <div class="sig-stop-header">
+                        <span class="sig-stop-num">Stop {{ b.stop_sequence ?? ($index + 1) }}</span>
+                        @if (b.stop?.stop_name) {
+                          <span class="sig-stop-name-label">— {{ b.stop!.stop_name }}</span>
+                        }
+                      </div>
+                    }
+                    <div class="sig-status-list">
+                      @for (role of [{ key: 'driver', label: 'Driver', icon: 'pi-user' }, { key: 'consignee', label: 'Consignee', icon: 'pi-building' }]; track role.key) {
+                        <div class="sig-status-row-item">
+                          <i class="pi {{ role.icon }} sig-status-row-icon"></i>
+                          <span class="sig-status-role">{{ role.label }}</span>
+                          @if (getSignature(b, role.key === 'driver' ? 'driver' : 'consignee'); as sig) {
+                            <span class="sig-status-name">{{ sig.signer_name }}</span>
+                            <span class="sig-status-date">{{ formatDate(sig.signed_at) }}</span>
+                            <span class="sig-status-pill signed" style="margin-left:auto;">
+                              <span class="sig-dot signed"></span>Signed
+                            </span>
+                          } @else if (isSignedByStatus(b, role.key === 'driver' ? 'driver' : 'consignee')) {
+                            <span class="sig-status-name">{{ role.key === 'driver' ? (b.driver_email ?? 'Driver') : 'Consignee' }}</span>
+                            <span class="sig-status-pill signed" style="margin-left:auto;">
+                              <span class="sig-dot signed"></span>Signed
+                            </span>
+                          } @else {
+                            <span class="sig-status-pill pending" style="margin-left:auto;">
+                              <span class="sig-dot pending"></span>Pending
+                            </span>
+                          }
+                        </div>
                       }
                     </div>
-                  }
-                </div>
+                  </div>
+                }
               </div>
             }
 
@@ -1097,8 +1174,16 @@ export class ShipmentViewerComponent implements OnInit, OnDestroy {
   safeUrl = computed(() => {
     const url = this.activeBol()?.pdf_url;
     if (!url) return null;
-    return this.sanitizer.bypassSecurityTrustResourceUrl(url);
+    // toolbar=0&navpanes=0 hides Chrome's PDF toolbar / sidebar
+    // zoom=page-width fits each page to the iframe's width so we can
+    // predict total height = pageCount * (width * 11/8.5)
+    return this.sanitizer.bypassSecurityTrustResourceUrl(
+      `${url}#toolbar=0&navpanes=0&zoom=page-width`,
+    );
   });
+
+  /** Number of pages on the active BOL — drives the scrollable iframe height. */
+  pageCount = computed(() => Math.max(1, this.activeBol()?.page_count ?? 1));
 
   // ── Annotation state ──────────────────────────────────────────────────────
   activeTool = signal<'none' | 'signature' | 'highlight' | 'redact'>('none');
@@ -1217,6 +1302,7 @@ export class ShipmentViewerComponent implements OnInit, OnDestroy {
         ? (bols.find(b => b.id === preselectBolId)?.id ?? bols[0]?.id)
         : bols[0]?.id;
       this.activeBolId.set(toSelect ?? null);
+      this.hydrateAnnotationsFromDb();
     } catch {
       this.error.set('Could not load shipment. It may not exist or you may not have access.');
     } finally {
@@ -1228,7 +1314,113 @@ export class ShipmentViewerComponent implements OnInit, OnDestroy {
     try {
       const bols = await this.bolsService.getByShipmentId(this.shipmentId);
       this.bols.set(bols);
+      this.hydrateAnnotationsFromDb();
     } catch { /* silently ignore realtime reload errors */ }
+  }
+
+  /**
+   * Rebuilds the local annotations signal from DB-sourced data:
+   *   - rows from signatures(*)  → signature overlays (drawn/typed/image)
+   *   - keys in bols.form_data   → form field + date stamp overlays
+   *
+   * Called after every load/reload so signatures placed by the mobile app
+   * appear on the PDF without the user having to re-place them.
+   */
+  private hydrateAnnotationsFromDb(): void {
+    const annList: AnnotationItem[] = [];
+    for (const bol of this.bols()) {
+      const sigs = ((bol as unknown as { signatures?: unknown[] }).signatures ?? []) as Array<{
+        id: string;
+        signer_role?: 'driver' | 'consignee' | null;
+        signer_type?: 'driver' | 'consignee' | null;
+        signer_name?: string | null;
+        page_number?: number | null;
+        x_pct?: number | null;
+        y_pct?: number | null;
+        width_pct?: number | null;
+        height_pct?: number | null;
+        signature_image_url?: string | null;
+        stroke_data?: { x: number; y: number }[][] | null;
+        typed_value?: string | null;
+      }>;
+      for (const s of sigs) {
+        // Skip rows without coordinates (legacy / desktop-placed without overlay coords)
+        if (s.x_pct == null || s.y_pct == null) continue;
+        let kind: 'drawn' | 'typed' | 'image' = 'image';
+        if (s.stroke_data && s.stroke_data.length > 0) kind = 'drawn';
+        else if (s.typed_value) kind = 'typed';
+        annList.push({
+          id: s.id,
+          bolId: bol.id,
+          type: 'signature',
+          x: s.x_pct, y: s.y_pct,
+          width: s.width_pct ?? 20, height: s.height_pct ?? 8,
+          pageNumber: s.page_number ?? 1,
+          imageUrl: s.signature_image_url ?? undefined,
+          rawStrokes: s.stroke_data ?? undefined,
+          typedValue: s.typed_value ?? undefined,
+          signatureKind: kind,
+          signerName: s.signer_name ?? undefined,
+          signerType: (s.signer_type ?? s.signer_role ?? undefined) as ('driver' | 'consignee' | undefined),
+          signerRole: (s.signer_role ?? s.signer_type ?? undefined) as ('driver' | 'consignee' | undefined),
+        });
+      }
+
+      // Form data: { fieldKey: { value, label, page, x_pct, y_pct, width_pct, height_pct, rotation, is_date_stamp? } }
+      const formData = (bol as unknown as { form_data?: Record<string, unknown> }).form_data;
+      if (formData && typeof formData === 'object') {
+        for (const [key, raw] of Object.entries(formData)) {
+          if (!raw || typeof raw !== 'object') continue;
+          const v = raw as Record<string, unknown>;
+          // Legacy flat shape ({key: "value"}) — skip; we can't position it.
+          if (typeof v['x_pct'] !== 'number' || typeof v['y_pct'] !== 'number') continue;
+          const isDateStamp = v['is_date_stamp'] === true;
+          annList.push({
+            id: `${bol.id}-${key}`,
+            bolId: bol.id,
+            type: isDateStamp ? 'date_stamp' : 'form_field',
+            x: v['x_pct'] as number,
+            y: v['y_pct'] as number,
+            width: (v['width_pct'] as number | undefined) ?? 22,
+            height: (v['height_pct'] as number | undefined) ?? 5,
+            pageNumber: (v['page'] as number | undefined) ?? 1,
+            fieldLabel: (v['label'] as string | undefined) ?? '',
+            fieldValue: (v['value'] as string | undefined) ?? '',
+            rotation: (v['rotation'] as number | undefined) ?? 0,
+          });
+        }
+      }
+    }
+    this.annotations.set(annList);
+  }
+
+  /** Builds an SVG viewBox+path string from the mobile's raw stroke data. */
+  strokesToSvgPath(rawStrokes: { x: number; y: number }[][]): { viewBox: string; d: string } {
+    if (!rawStrokes || rawStrokes.length === 0) return { viewBox: '0 0 100 100', d: '' };
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const stroke of rawStrokes) {
+      for (const p of stroke) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    if (!isFinite(minX)) return { viewBox: '0 0 100 100', d: '' };
+    const pad = 4;
+    const w = (maxX - minX) + pad * 2;
+    const h = (maxY - minY) + pad * 2;
+    const parts: string[] = [];
+    for (const stroke of rawStrokes) {
+      if (stroke.length === 0) continue;
+      const first = stroke[0];
+      parts.push(`M ${(first.x - minX + pad).toFixed(2)} ${(first.y - minY + pad).toFixed(2)}`);
+      for (let i = 1; i < stroke.length; i++) {
+        const p = stroke[i];
+        parts.push(`L ${(p.x - minX + pad).toFixed(2)} ${(p.y - minY + pad).toFixed(2)}`);
+      }
+    }
+    return { viewBox: `0 0 ${w.toFixed(2)} ${h.toFixed(2)}`, d: parts.join(' ') };
   }
 
   private subscribeToChanges(): void {
@@ -1246,6 +1438,7 @@ export class ShipmentViewerComponent implements OnInit, OnDestroy {
   selectBol(bolId: string): void {
     this.activeBolId.set(bolId);
     this.router.navigate([], { queryParams: { bol: bolId }, replaceUrl: true });
+    this.hydrateAnnotationsFromDb();
   }
 
   goBack(): void {
